@@ -1,0 +1,188 @@
+{
+  "name": "Autonomous Document Intelligence Pipeline",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "doc-intake", "options": {} },
+      "id": "n1", "name": "Document Webhook",
+      "type": "n8n-nodes-base.webhook", "typeVersion": 2,
+      "position": [-1000, 300], "webhookId": "doc-intake"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || {};\nconst imageBase64 = body.image || '';\nif (!imageBase64) return [{ json: { valid: false, error: 'No image' } }];\nreturn [{ json: {\n  valid: true,\n  imageBase64,\n  docId: body.docId || ('DOC-' + Date.now().toString(36).toUpperCase()),\n  attempt: 1,\n  langHints: [],\n  receivedAt: new Date().toISOString()\n} }];"
+      },
+      "id": "n2", "name": "Validate Input",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [-800, 300]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{ $json.valid }}", "value2": true }] }
+      },
+      "id": "n3", "name": "Is Valid?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1,
+      "position": [-600, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hash the image content so we can dedupe before doing any expensive OCR work\nconst crypto = require('crypto');\nconst j = $input.first().json;\nconst hash = crypto.createHash('sha256').update(j.imageBase64).digest('hex');\nreturn [{ json: { ...j, contentHash: hash } }];"
+      },
+      "id": "n4", "name": "Compute Content Hash",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [-400, 220]
+    },
+    {
+      "parameters": {
+        "collection": "extracted_documents",
+        "options": { "limit": 1 },
+        "query": "={{ JSON.stringify({ contentHash: $json.contentHash }) }}"
+      },
+      "id": "n5", "name": "Dedup: Find Existing",
+      "type": "n8n-nodes-base.mongoDb", "typeVersion": 1.1,
+      "position": [-200, 220],
+      "credentials": { "mongoDb": { "id": "mongo-demo-creds", "name": "MongoDB Demo" } }
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{ !!$json._id }}", "value2": true }] }
+      },
+      "id": "n6", "name": "Already Processed?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1,
+      "position": [0, 220]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'duplicate', docId: $json.docId, existingId: $json._id }) }}"
+      },
+      "id": "n7", "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1,
+      "position": [200, 120]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://vision.googleapis.com/v1/images:annotate",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "key", "value": "={{ $credentials.googleVisionApiKey }}" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ requests: [{ image: { content: $json.imageBase64 }, features: [{ type: 'TEXT_DETECTION' }], imageContext: { languageHints: $json.langHints } }] }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "n8", "name": "Google Vision OCR",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [200, 320],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify doc type + score confidence from what OCR actually found.\n// This is the \"autonomous decision\" step: the workflow decides its own next move.\nconst res = $input.first().json;\nconst prior = $('Dedup: Find Existing').first().json._meta || $('Compute Content Hash').first().json;\nconst annotation = (res.responses && res.responses[0]) || {};\nconst rawText = (annotation.fullTextAnnotation && annotation.fullTextAnnotation.text) || '';\nconst detectedLang = (annotation.textAnnotations && annotation.textAnnotations[0] && annotation.textAnnotations[0].locale) || 'unknown';\n\nconst RULES = [\n  { type: 'invoice', kws: ['invoice', 'total', 'amount due', 'gstin'] },\n  { type: 'id_card', kws: ['date of birth', 'id no', 'government', 'identity'] },\n  { type: 'certificate', kws: ['certify', 'certificate', 'awarded', 'completion'] }\n];\nconst lower = rawText.toLowerCase();\nlet docType = 'unknown', hits = 0;\nfor (const r of RULES) {\n  const h = r.kws.filter(k => lower.includes(k)).length;\n  if (h > hits) { hits = h; docType = r.type; }\n}\n\n// Confidence = fraction of expected keywords found + whether any text came back at all\nconst confidence = rawText ? Math.min(1, (hits / 2) + (rawText.length > 50 ? 0.3 : 0)) : 0;\n\nreturn [{ json: {\n  ...prior,\n  rawText, detectedLang, docType, confidence,\n  needsRetry: confidence < 0.5 && prior.attempt < 3\n} }];"
+      },
+      "id": "n9", "name": "Classify & Score Confidence",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [400, 320]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{ $json.needsRetry }}", "value2": true }] }
+      },
+      "id": "n10", "name": "Confidence Too Low?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1,
+      "position": [620, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Autonomous retry: try a different language hint on each pass instead of giving up immediately\nconst j = $input.first().json;\nconst LANG_CYCLE = [[], ['en'], ['hi', 'gu']];\nconst nextAttempt = (j.attempt || 1) + 1;\nreturn [{ json: { ...j, attempt: nextAttempt, langHints: LANG_CYCLE[nextAttempt - 1] || [] } }];"
+      },
+      "id": "n11", "name": "Prepare Retry (new lang hints)",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [840, 220]
+    },
+    {
+      "parameters": { "amount": 3 },
+      "id": "n12", "name": "Wait Before Retry",
+      "type": "n8n-nodes-base.wait", "typeVersion": 1.1,
+      "position": [1060, 220],
+      "webhookId": "retry-wait-doc-intake"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Final gate: if we're still under 0.5 confidence after 3 attempts, this needs a human.\nconst j = $input.first().json;\nreturn [{ json: { ...j, escalate: j.confidence < 0.5 } }];"
+      },
+      "id": "n13", "name": "Final Decision Gate",
+      "type": "n8n-nodes-base.code", "typeVersion": 2,
+      "position": [840, 420]
+    },
+    {
+      "parameters": {
+        "conditions": { "boolean": [{ "value1": "={{ $json.escalate }}", "value2": true }] }
+      },
+      "id": "n14", "name": "Needs Human Review?",
+      "type": "n8n-nodes-base.if", "typeVersion": 1,
+      "position": [1060, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: Doc ' + $json.docId + ' could not be auto-classified after 3 attempts (confidence ' + Math.round($json.confidence * 100) + '%). Needs manual review.' }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "n15", "name": "Escalate to Human (Slack)",
+      "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [1280, 360],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "extracted_documents",
+        "fields": "docId,contentHash,docType,detectedLang,rawText,confidence,attempt,receivedAt",
+        "options": {}
+      },
+      "id": "n16", "name": "Store Final Result",
+      "type": "n8n-nodes-base.mongoDb", "typeVersion": 1.1,
+      "position": [1280, 480],
+      "credentials": { "mongoDb": { "id": "mongo-demo-creds", "name": "MongoDB Demo" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: $json.escalate ? 'escalated' : 'processed', docId: $json.docId, docType: $json.docType, confidence: $json.confidence, attempts: $json.attempt }) }}"
+      },
+      "id": "n17", "name": "Respond Final",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1,
+      "position": [1500, 480]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: $json.error || 'Invalid request' }) }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "n18", "name": "Respond Invalid",
+      "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1,
+      "position": [-600, 420]
+    }
+  ],
+  "connections": {
+    "Document Webhook": { "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]] },
+    "Validate Input": { "main": [[{ "node": "Is Valid?", "type": "main", "index": 0 }]] },
+    "Is Valid?": { "main": [[{ "node": "Compute Content Hash", "type": "main", "index": 0 }], [{ "node": "Respond Invalid", "type": "main", "index": 0 }]] },
+    "Compute Content Hash": { "main": [[{ "node": "Dedup: Find Existing", "type": "main", "index": 0 }]] },
+    "Dedup: Find Existing": { "main": [[{ "node": "Already Processed?", "type": "main", "index": 0 }]] },
+    "Already Processed?": { "main": [[{ "node": "Respond Duplicate", "type": "main", "index": 0 }], [{ "node": "Google Vision OCR", "type": "main", "index": 0 }]] },
+    "Google Vision OCR": { "main": [[{ "node": "Classify & Score Confidence", "type": "main", "index": 0 }]] },
+    "Classify & Score Confidence": { "main": [[{ "node": "Confidence Too Low?", "type": "main", "index": 0 }]] },
+    "Confidence Too Low?": { "main": [[{ "node": "Prepare Retry (new lang hints)", "type": "main", "index": 0 }], [{ "node": "Final Decision Gate", "type": "main", "index": 0 }]] },
+    "Prepare Retry (new lang hints)": { "main": [[{ "node": "Wait Before Retry", "type": "main", "index": 0 }]] },
+    "Wait Before Retry": { "main": [[{ "node": "Google Vision OCR", "type": "main", "index": 0 }]] },
+    "Final Decision Gate": { "main": [[{ "node": "Needs Human Review?", "type": "main", "index": 0 }]] },
+    "Needs Human Review?": { "main": [[{ "node": "Escalate to Human (Slack)", "type": "main", "index": 0 }], [{ "node": "Store Final Result", "type": "main", "index": 0 }]] },
+    "Escalate to Human (Slack)": { "main": [[{ "node": "Store Final Result", "type": "main", "index": 0 }]] },
+    "Store Final Result": { "main": [[{ "node": "Respond Final", "type": "main", "index": 0 }]] }
+  }
+}
